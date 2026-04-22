@@ -68,6 +68,10 @@ def tunable(knobs: Dict[str, dict]):
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            # Pop _apply_at early — before the ctx check — so non-rank-0
+            # processes (where ctx is None) don't pass it to the real function.
+            apply_at = kwargs.pop("_apply_at", "epoch_boundary")
+
             ctx = _ctx_module._global_context
             if ctx is None or ctx._noop:
                 return func(*args, **kwargs)
@@ -82,7 +86,7 @@ def tunable(knobs: Dict[str, dict]):
 
             # Drain pending actions for this function
             namespace = ctx.namespace
-            actions = ctx.drain_actions_for(func_name)
+            actions = ctx.drain_actions_for(func_name, at=apply_at)
 
             applied = []
             for action in actions:
