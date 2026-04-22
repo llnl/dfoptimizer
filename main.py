@@ -72,6 +72,18 @@ def main():
     parser.add_argument("--pull-timeout-ms", type=int, default=int(os.environ.get("DFOPTIMIZER_PULL_TIMEOUT_MS", "1000")))
     parser.add_argument("--consumer-name", default=os.environ.get("DFOPTIMIZER_CONSUMER_NAME", ""))
     parser.add_argument("--debug", action="store_true", default=os.environ.get("DFOPTIMIZER_DEBUG", "") == "1")
+    parser.add_argument("--no-registry", action="store_true",
+                        help="Skip knob registry consumer (for global optimizer that has no knob defs)")
+    parser.add_argument("--global-group-file", default="",
+                        help="Group file for global infra bedrock (ofi+cxi). Enables global plan relay.")
+    parser.add_argument("--global-input-topic", default="global_plans",
+                        help="Topic on global bedrock to consume plans from")
+    parser.add_argument(
+        "--relay-only",
+        action="store_true",
+        default=os.environ.get("DFOPTIMIZER_RELAY_ONLY", "") == "1",
+        help="Skip local finding consumption and only relay global plans locally",
+    )
     args = parser.parse_args()
 
     configure_logging(level="debug" if args.debug else "info")
@@ -96,6 +108,10 @@ def main():
         consumer_name=args.consumer_name,
         idle_timeout_sec=args.idle_timeout,
         pull_timeout_ms=args.pull_timeout_ms,
+        no_registry=args.no_registry,
+        global_group_file=args.global_group_file,
+        global_input_topic=args.global_input_topic,
+        relay_only=args.relay_only,
     )
 
 

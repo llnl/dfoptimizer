@@ -8,12 +8,13 @@ class KnobResponse:
 
     direction: Literal["increase", "decrease", "set"]
     step: Any = None  # for increase/decrease
+    step_mode: Literal["add", "multiply", "evidence"] = "add"  # "add": old+step, "multiply": old*step, "evidence": computed from finding metrics
     set_to: Any = None  # for direction="set"
     min_severity: float = 0.5
     min_persistence: int = 2
     cooldown_windows: int = 3
     apply_when: str = "epoch_boundary"
-    skip_motifs: List[str] = dc.field(default_factory=lambda: ["warmup_transient"])
+    effectiveness_threshold: float = 0.10  # min severity improvement to allow next action
 
 
 @dc.dataclass
@@ -53,6 +54,7 @@ class ActionPlan:
     severity: float
     opportunity_tag: str
     window_index: int
+    target_nodes: List[str] = dc.field(default_factory=list)  # empty = all nodes
 
 
 @dc.dataclass
@@ -73,7 +75,8 @@ class DiagnosisFindingMsg:
 
     finding_type: str
     motif: str
-    severity: str
+    severity: str  # human-readable label for logging
+    severity_score: float  # continuous [0.0, 1.0] for gating/scaling
     confidence: float
     prevalence: float
     persistence: int
@@ -88,6 +91,8 @@ class DiagnosisFindingMsg:
     last_seen_window: int = 0
     window_index: int = 0
     publish_mode: str = "control"
+    suppresses_tags: List[str] = dc.field(default_factory=list)
+    key_metrics: Dict[str, float] = dc.field(default_factory=dict)
 
 
 @dc.dataclass
