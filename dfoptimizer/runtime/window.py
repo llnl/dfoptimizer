@@ -1,6 +1,6 @@
 """Application-agnostic analysis window for streaming I/O optimization.
 
-The Window manages temporal boundaries for the DFSuite analysis pipeline.
+The Window manages temporal boundaries for the LiveFlow analysis pipeline.
 Instead of hardcoded epoch/step trigger logic, the application calls
 ``window.start()`` and ``window.stop()`` at each logical iteration.
 The Window emits analysis boundary events to DFTracer at a configurable
