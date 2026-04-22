@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import threading
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -53,6 +54,8 @@ class OptimizerContext:
         self._listener_driver = None
         self._producer = None  # for acks
         self._registry_producer = None  # for knob registration
+        self._global_ack_producer = None
+        self._global_registry_producer = None
         self._noop = False
 
     def start(self):
@@ -73,16 +76,34 @@ class OptimizerContext:
             self._thread = None
         self._release_producer("_producer")
         self._release_producer("_registry_producer")
+        self._release_producer("_global_ack_producer")
+        self._release_producer("_global_registry_producer")
         self._consumer = None
         self._listener_driver = None
         logger.info("optimizer.context.stopped")
 
-    def drain_actions_for(self, func_name: str) -> List[ActionPlan]:
-        """Return and clear all pending actions for a given target function."""
+    def drain_actions_for(
+        self, func_name: str, at: str = "epoch_boundary"
+    ) -> List[ActionPlan]:
+        """Return pending actions whose ``apply_when`` matches *at*.
+
+        Actions that don't match remain in the queue for a later drain
+        with the appropriate *at* value.  For example, ``epoch_boundary``
+        actions stay queued when called with ``at="window_boundary"`` and are
+        only drained when the caller passes ``at="epoch_boundary"``.
+        """
         with self._lock:
-            actions = list(self._queues[func_name].values())
-            self._queues[func_name].clear()
-        return actions
+            pending = self._queues[func_name]
+            matched = []
+            remaining = {}
+            for knob_id, plan in pending.items():
+                if plan.apply_when == at or at == "epoch_boundary":
+                    # epoch_boundary drains everything (superset of step)
+                    matched.append(plan)
+                else:
+                    remaining[knob_id] = plan
+            self._queues[func_name] = remaining
+        return matched
 
     def ack_action(self, plan: ActionPlan, old_value, new_value, status="applied"):
         ack = ActionAck(
@@ -205,13 +226,25 @@ class OptimizerContext:
             severity=msg.get("severity", 0),
             opportunity_tag=msg.get("opportunity_tag", ""),
             window_index=msg.get("window_index", 0),
+            target_nodes=msg.get("target_nodes", []),
         )
+
+        # Per-node plan filter: skip plans not targeting this node.
+        if plan.target_nodes and socket.gethostname() not in plan.target_nodes:
+            logger.debug(
+                "optimizer.context.plan_filtered",
+                plan_id=plan.plan_id,
+                target_nodes=plan.target_nodes,
+                hostname=socket.gethostname(),
+            )
+            return
 
         logger.info(
             "optimizer.context.plan_received",
             plan_id=plan.plan_id,
             knob_id=plan.knob_id,
             new_value=plan.new_value,
+            target_nodes=plan.target_nodes or "all",
         )
 
         with self._lock:
@@ -231,6 +264,12 @@ class OptimizerContext:
             metadata = {"type": "action_ack", "plan_id": ack.plan_id}
             self._producer.push(metadata=metadata, data=payload)
             self._producer.flush()
+            self._publish_global_mirror(
+                producer_attr="_global_ack_producer",
+                topic=os.environ.get("DFOPTIMIZER_GLOBAL_ACKS_TOPIC", "optimizer_acks"),
+                payload=payload,
+                metadata=metadata,
+            )
         except Exception:
             logger.warning("optimizer.ack.publish_failed", plan_id=ack.plan_id, exc_info=True)
 
@@ -252,6 +291,12 @@ class OptimizerContext:
             }
             self._registry_producer.push(metadata=metadata, data=payload)
             self._registry_producer.flush()
+            self._publish_global_mirror(
+                producer_attr="_global_registry_producer",
+                topic=os.environ.get("DFOPTIMIZER_GLOBAL_REGISTRY_TOPIC", self.topic_registry),
+                payload=payload,
+                metadata=metadata,
+            )
             logger.info(
                 "optimizer.knobs.published",
                 namespace=registration["namespace"],
@@ -260,6 +305,38 @@ class OptimizerContext:
             )
         except Exception:
             logger.warning("optimizer.knobs.publish_failed", exc_info=True)
+
+    def _publish_global_mirror(
+        self,
+        producer_attr: str,
+        topic: str,
+        payload: bytes,
+        metadata: dict,
+    ):
+        global_group_file = os.environ.get("INFRA_CXI_GROUP", "").strip()
+        if not global_group_file or global_group_file == self.group_file:
+            return
+        try:
+            producer = getattr(self, producer_attr, None)
+            if producer is None:
+                from ..streaming.mofka_io import open_producer
+                _, producer = open_producer(global_group_file, topic)
+                setattr(self, producer_attr, producer)
+            producer.push(metadata=metadata, data=payload)
+            producer.flush()
+            logger.info(
+                "optimizer.global_mirror.published",
+                topic=topic,
+                global_group_file=global_group_file,
+                metadata_type=metadata.get("type", ""),
+            )
+        except Exception:
+            logger.warning(
+                "optimizer.global_mirror.publish_failed",
+                topic=topic,
+                global_group_file=global_group_file,
+                exc_info=True,
+            )
 
     def _release_producer(self, attr_name: str):
         producer = getattr(self, attr_name, None)
