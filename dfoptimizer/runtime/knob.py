@@ -40,12 +40,13 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         responds_to[tag] = KnobResponse(
             direction=spec.get("direction", "increase"),
             step=spec.get("step"),
+            step_mode=spec.get("step_mode", "add"),
             set_to=spec.get("set_to"),
             min_severity=spec.get("min_severity", 0.5),
             min_persistence=spec.get("min_persistence", 2),
             cooldown_windows=spec.get("cooldown_windows", 3),
             apply_when=spec.get("apply_when", "epoch_boundary"),
-            skip_motifs=spec.get("skip_motifs", ["warmup_transient"]),
+            effectiveness_threshold=spec.get("effectiveness_threshold", 0.10),
         )
 
     return KnobDef(
@@ -67,12 +68,13 @@ def knob_def_to_wire(kdef: KnobDef) -> dict:
         responds_wire[tag] = {
             "direction": resp.direction,
             "step": resp.step,
+            "step_mode": resp.step_mode,
             "set_to": resp.set_to,
             "min_severity": resp.min_severity,
             "min_persistence": resp.min_persistence,
             "cooldown_windows": resp.cooldown_windows,
             "apply_when": resp.apply_when,
-            "skip_motifs": resp.skip_motifs,
+            "effectiveness_threshold": resp.effectiveness_threshold,
         }
 
     return {
@@ -97,12 +99,13 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         responds_to[tag] = KnobResponse(
             direction=spec.get("direction", "increase"),
             step=spec.get("step"),
+            step_mode=spec.get("step_mode", "add"),
             set_to=spec.get("set_to"),
             min_severity=spec.get("min_severity", 0.5),
             min_persistence=spec.get("min_persistence", 2),
             cooldown_windows=spec.get("cooldown_windows", 3),
             apply_when=spec.get("apply_when", "epoch_boundary"),
-            skip_motifs=spec.get("skip_motifs", ["warmup_transient"]),
+            effectiveness_threshold=spec.get("effectiveness_threshold", 0.10),
         )
 
     return KnobDef(
