@@ -36,9 +36,16 @@ class OptimizerContext:
         topic_plans: str = "optimizer.plans",
         topic_acks: str = "optimizer.acks",
         topic_registry: str = "optimizer.registry",
+        zmq_plans_endpoint: str = "",
+        zmq_plans_bind: bool = False,
     ):
         self.namespace = namespace
         self.protocol = protocol
+        # ZMQ plan transport (additive): when zmq_plans_endpoint is set, the listener
+        # pulls ActionPlans over ZMQ instead of Mofka. Empty -> Mofka path unchanged.
+        self.zmq_plans_endpoint = zmq_plans_endpoint
+        self.zmq_plans_bind = zmq_plans_bind
+        self._zmq_context = None
         self.group_file = group_file
         self.topic_plans = topic_plans
         self.topic_acks = topic_acks
@@ -59,15 +66,18 @@ class OptimizerContext:
         self._noop = False
 
     def start(self):
-        """Start the background Mofka listener thread."""
+        """Start the background plan-listener thread (Mofka, or ZMQ if an endpoint
+        is configured)."""
         if self._noop:
             return
         self._running = True
+        target = self._listen_loop_zmq if self.zmq_plans_endpoint else self._listen_loop
         self._thread = threading.Thread(
-            target=self._listen_loop, daemon=True, name="dfoptimizer-ctx"
+            target=target, daemon=True, name="dfoptimizer-ctx"
         )
         self._thread.start()
-        logger.info("optimizer.context.started", namespace=self.namespace)
+        logger.info("optimizer.context.started", namespace=self.namespace,
+                    transport="zmq" if self.zmq_plans_endpoint else "mofka")
 
     def stop(self):
         self._running = False
@@ -204,6 +214,63 @@ class OptimizerContext:
         del driver
         self._consumer = None
         self._listener_driver = None
+
+    # -- ZMQ listener (additive; mirrors the Mofka _listen_loop) --
+
+    def _listen_loop_zmq(self):
+        """Pull ActionPlan messages over ZMQ (multipart [metadata, plan_json],
+        matching the optimizer's run_zmq publish) and hand the payload to the shared,
+        transport-agnostic _handle_plan_event."""
+        try:
+            import zmq
+            from ..streaming.zmq_io import open_consumer
+            context, consumer = open_consumer(
+                self.zmq_plans_endpoint, bind=self.zmq_plans_bind
+            )
+        except Exception:
+            logger.warning("optimizer.context.zmq_connect_failed", exc_info=True)
+            self._noop = True
+            return
+
+        self._zmq_context = context
+        self._consumer = consumer
+        poller = zmq.Poller()
+        poller.register(consumer, zmq.POLLIN)
+
+        class _PlanEv:
+            __slots__ = ("data",)
+
+            def __init__(self, data):
+                self.data = data
+
+        while self._running:
+            try:
+                socks = dict(poller.poll(timeout=500))
+            except Exception as ex:
+                logger.error("optimizer.context.zmq_listen_error", error=str(ex))
+                break
+            if consumer not in socks:
+                continue
+            try:
+                parts = consumer.recv_multipart()
+            except Exception as ex:
+                logger.error("optimizer.context.zmq_recv_error", error=str(ex))
+                break
+            if not parts:
+                continue
+            payload = parts[1] if len(parts) > 1 else parts[0]
+            try:
+                self._handle_plan_event(_PlanEv(payload))
+            except Exception:
+                logger.exception("optimizer.context.plan_event_error")
+
+        try:
+            consumer.close(linger=0)
+            context.term()
+        except Exception:
+            pass
+        self._consumer = None
+        self._zmq_context = None
 
     def _handle_plan_event(self, event):
         payload = event.data
@@ -370,6 +437,7 @@ def optimizer_context(
     topic_plans: str = "optimizer.plans",
     topic_acks: str = "optimizer.acks",
     topic_registry: str = "optimizer.registry",
+    zmq_plans_endpoint: str = "",
 ) -> OptimizerContext:
     """Create or return the global OptimizerContext.
 
@@ -381,7 +449,14 @@ def optimizer_context(
         if _global_context is not None:
             return _global_context
 
-        if not group_file or not os.path.exists(group_file):
+        if zmq_plans_endpoint:
+            logger.info("optimizer.context.zmq", endpoint=zmq_plans_endpoint)
+            ctx = OptimizerContext(
+                namespace=namespace,
+                protocol=protocol,
+                zmq_plans_endpoint=zmq_plans_endpoint,
+            )
+        elif not group_file or not os.path.exists(group_file):
             logger.info("optimizer.context.no_group_file")
             ctx = _NoopContext(namespace=namespace)
         else:
