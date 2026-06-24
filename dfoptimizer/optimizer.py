@@ -387,6 +387,109 @@ class Optimizer:
                 del consumer
             del producer
 
+    def run_zmq(
+        self,
+        address: str,
+        bind: bool = True,
+        output_address: str = "",
+        output_bind: bool = True,
+        idle_timeout_sec: float = 10.0,
+        poll_timeout_ms: int = 1000,
+        plan_handler=None,
+    ):
+        """ZMQ streaming consumer mirroring run_mofka's core loop: pull diagnosis
+        findings (multipart [metadata, wire_dict], matching diagnose_zmq), run the
+        planner, emit/collect ActionPlans. Skips the Mofka registry/ack/global-plan
+        machinery; knobs come from _maybe_bootstrap_knobs (DFOPTIMIZER_BOOTSTRAP_DLIO=1).
+        Returns the list of plans produced."""
+        import zmq
+        from .streaming.zmq_io import open_consumer, open_producer
+
+        class _Ev:
+            __slots__ = ("metadata", "data")
+
+            def __init__(self, metadata, data):
+                self.metadata = metadata
+                self.data = data
+
+        context, consumer = open_consumer(address, bind=bind)
+        poller = zmq.Poller()
+        poller.register(consumer, zmq.POLLIN)
+
+        out_ctx = producer = None
+        if output_address:
+            out_ctx, producer = open_producer(output_address, bind=output_bind)
+        self._output_topic = output_address
+        self._plan_fanout = 1
+
+        self._maybe_bootstrap_knobs()
+        install_shutdown_handler()
+
+        event_count = plan_count = 0
+        last_event_time = None
+        plans_all = []
+        logger.info("optimizer.zmq.start", address=address, idle_timeout_sec=idle_timeout_sec)
+        try:
+            while not _shutdown_requested:
+                socks = dict(poller.poll(timeout=poll_timeout_ms))
+                if consumer not in socks:
+                    if (last_event_time is not None and idle_timeout_sec > 0
+                            and (time.monotonic() - last_event_time) >= idle_timeout_sec):
+                        logger.info("optimizer.zmq.idle_timeout",
+                                    idle_sec=round(time.monotonic() - last_event_time, 1))
+                        break
+                    continue
+                parts = consumer.recv_multipart()
+                last_event_time = time.monotonic()
+                event_count += 1
+                try:
+                    meta = json.loads(parts[0].decode("utf-8")) if parts else {}
+                except (ValueError, TypeError):
+                    meta = {}
+                if meta.get("name") == "end" or meta.get("type") == "stop":
+                    logger.info("optimizer.zmq.stop_sentinel")
+                    break
+                data = parts[1] if len(parts) > 1 else None
+                try:
+                    finding = self._parse_finding(_Ev(meta, data))
+                    if finding is not None:
+                        for plan in self.planner.process_finding(finding):
+                            plans_all.append(plan)
+                            plan_count += 1
+                            if producer is not None:
+                                self._publish_plan_zmq(producer, plan)
+                            if plan_handler is not None:
+                                plan_handler(plan)
+                            logger.info("optimizer.plan", plan_id=plan.plan_id,
+                                        knob_id=plan.knob_id, old_value=plan.old_value,
+                                        new_value=plan.new_value,
+                                        target_function=plan.target_function,
+                                        rationale=plan.rationale)
+                except Exception:
+                    logger.exception("optimizer.zmq.event_error", event_index=event_count)
+        finally:
+            logger.info("optimizer.zmq.done", event_count=event_count,
+                        plan_count=plan_count, knob_state=dict(self.planner.current_values))
+            if producer is not None:
+                producer.close(linger=0)
+                out_ctx.term()
+            consumer.close(linger=0)
+            context.term()
+        return plans_all
+
+    def _publish_plan_zmq(self, producer, plan: ActionPlan):
+        metadata = {
+            "type": "action_plan",
+            "plan_id": plan.plan_id,
+            "knob_id": plan.knob_id,
+            "target_function": plan.target_function,
+        }
+        producer.send_multipart([
+            json.dumps(metadata).encode("utf-8"),
+            json.dumps(dataclasses.asdict(plan)).encode("utf-8"),
+        ])
+        self._plans_produced += 1
+
     def _registry_loop(self, group_file: str, registry_topic: str, consumer=None):
         """Background thread: listen for knob registrations from apps."""
         if consumer is None:
