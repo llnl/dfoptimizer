@@ -490,6 +490,40 @@ class Optimizer:
         ])
         self._plans_produced += 1
 
+    def run_file(self, findings_path: str, plan_handler=None):
+        """Offline: replay saved diagnosis findings (a JSONL file of finding wire-dicts,
+        one per line, or a JSON array) through the planner and return the ActionPlans it
+        would emit. No transport, no actuation -- the optimizer analog of dfdiagnoser's
+        diagnose_facts, for reproducing/inspecting planner decisions on recorded findings."""
+        class _Ev:
+            __slots__ = ("metadata", "data")
+
+            def __init__(self, data):
+                self.metadata = {}
+                self.data = data
+
+        self._maybe_bootstrap_knobs()
+        with open(findings_path, "r", encoding="utf-8") as fh:
+            text = fh.read().strip()
+        records = json.loads(text) if text.startswith("[") else [
+            json.loads(line) for line in text.splitlines() if line.strip()
+        ]
+        plans_all = []
+        for rec in records:
+            finding = self._parse_finding(_Ev(json.dumps(rec).encode("utf-8")))
+            if finding is None:
+                continue
+            for plan in self.planner.process_finding(finding):
+                plans_all.append(plan)
+                if plan_handler is not None:
+                    plan_handler(plan)
+                logger.info("optimizer.plan", plan_id=plan.plan_id, knob_id=plan.knob_id,
+                            old_value=plan.old_value, new_value=plan.new_value,
+                            target_function=plan.target_function, rationale=plan.rationale)
+        logger.info("optimizer.file.done", findings=len(records),
+                    plan_count=len(plans_all), knob_state=dict(self.planner.current_values))
+        return plans_all
+
     def _registry_loop(self, group_file: str, registry_topic: str, consumer=None):
         """Background thread: listen for knob registrations from apps."""
         if consumer is None:
