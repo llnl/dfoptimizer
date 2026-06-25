@@ -1,0 +1,39 @@
+name: Build and Test
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04"]
+        python-version: ["3.10", "3.11", "3.12"]
+    name: ${{ matrix.os }}-${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv and set the Python version
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the project
+        run: uv sync --extra streaming --dev
+
+      - name: Run unit tests
+        run: uv run pytest -v tests/
+
+      - name: Run DFOptimizer (offline findings replay)
+        run: |
+          DFOPTIMIZER_BOOTSTRAP_DLIO=1 uv run python main.py \
+            --transport file \
+            --findings-file ${{ github.workspace }}/tests/data/findings.jsonl
