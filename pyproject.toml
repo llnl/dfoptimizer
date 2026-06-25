@@ -1,0 +1,22 @@
+[project]
+name = "dfoptimizer"
+version = "0.1.0"
+description = "Streaming runtime I/O optimizer for HPC/AI workloads"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "structlog",
+]
+
+[project.optional-dependencies]
+streaming = ["pyzmq"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dfoptimizer*"]
+
+[dependency-groups]
+dev = ["pytest"]

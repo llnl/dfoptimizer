@@ -1,0 +1,762 @@
+"""DFOptimizer service: consumes DiagnosisFindings, produces ActionPlans.
+
+Runs as a standalone process alongside the pipeline:
+  DFTracer -> Mofka -> DFAnalyzer -> Mofka -> DFDiagnoser -> Mofka -> DFOptimizer
+
+The optimizer starts with an empty planner. Apps register their knobs
+(including responds_to rules) via the ``optimizer.registry`` Mofka topic.
+Once knobs are registered, the planner can match incoming findings to
+knob responses and emit ActionPlans.
+"""
+
+import dataclasses
+import json
+import os
+import signal
+import threading
+import time
+from typing import Dict, List
+
+import structlog
+
+from .types import ActionPlan, DiagnosisFindingMsg, KnobDef
+from .runtime.knob import knob_def_from_dict, knob_def_from_wire
+from .planner.planner import Planner
+
+logger = structlog.get_logger()
+
+_shutdown_requested = False
+
+
+def _sigterm_handler(signum, frame):
+    del signum, frame
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+def install_shutdown_handler():
+    global _shutdown_requested
+    _shutdown_requested = False
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
+class Optimizer:
+    def __init__(self):
+        self.planner = Planner()
+        self._plans_produced = 0
+        self._output_topic = ""
+        self._plan_fanout = 1
+
+    def _maybe_bootstrap_knobs(self):
+        if os.environ.get("DFOPTIMIZER_BOOTSTRAP_DLIO", "0") != "1":
+            return
+
+        if self.planner.knobs:
+            return
+
+        knob_boundary = os.environ.get("DLIO_KNOB_BOUNDARY", "window_boundary")
+        knob_min_threads = int(os.environ.get("DLIO_KNOB_MIN_THREADS", "0"))
+        knob_max_threads = int(
+            os.environ.get("DLIO_KNOB_MAX_THREADS", str(os.cpu_count() or 8))
+        )
+        if knob_min_threads > knob_max_threads:
+            knob_min_threads = knob_max_threads
+
+        bootstrap_read_threads = int(
+            os.environ.get(
+                "DFOPTIMIZER_BOOTSTRAP_READ_THREADS",
+                str(max(knob_min_threads, 1 if knob_max_threads > 0 else 0)),
+            )
+        )
+        bootstrap_prefetch_size = int(
+            os.environ.get("DFOPTIMIZER_BOOTSTRAP_PREFETCH_SIZE", "2")
+        )
+
+        knob_defs = {
+            "dlio.prefetch_size": knob_def_from_dict(
+                "dlio.prefetch_size",
+                {
+                    "default": 2,
+                    "type": int,
+                    "range": (1, 16),
+                    "scope": "job",
+                    "responds_to": {
+                        "dataloader_prefetch": {
+                            "direction": "increase",
+                            "step_mode": "add",
+                            "step": 2,
+                            "min_persistence": 1,
+                            "cooldown_windows": 2,
+                            "apply_when": knob_boundary,
+                        },
+                    },
+                },
+                target_function="DLIOBenchmark.make_loader",
+            ),
+            "dlio.read_threads": knob_def_from_dict(
+                "dlio.read_threads",
+                {
+                    "default": max(0, knob_min_threads),
+                    "type": int,
+                    "range": (knob_min_threads, knob_max_threads),
+                    "scope": "job",
+                    "responds_to": {
+                        "reader_parallelism": {
+                            "direction": "increase",
+                            "step_mode": "evidence",
+                            "min_persistence": 1,
+                            "cooldown_windows": 1,
+                            "apply_when": knob_boundary,
+                        },
+                        "reader_contention": {
+                            "direction": "decrease",
+                            "step": 1,
+                            "min_persistence": 2,
+                            "cooldown_windows": 3,
+                            "apply_when": knob_boundary,
+                        },
+                    },
+                },
+                target_function="DLIOBenchmark.make_loader",
+            ),
+        }
+        current_values = {
+            "dlio.prefetch_size": bootstrap_prefetch_size,
+            "dlio.read_threads": bootstrap_read_threads,
+        }
+        self.planner.register_knobs(knob_defs, current_values=current_values)
+        logger.info(
+            "optimizer.registry.bootstrapped",
+            source="env",
+            knobs=list(knob_defs.keys()),
+            current_values=current_values,
+        )
+
+    def _wait_for_event(self, future, wait_ms: int):
+        try:
+            return future.wait(timeout_ms=wait_ms)
+        except Exception as ex:
+            if "timeout" in str(ex).lower():
+                return None
+            raise
+
+    def _process_global_plan_event(self, event, local_producer):
+        import socket
+
+        local_hostname = socket.gethostname()
+        metadata = event.metadata
+        payload = event.data
+        if isinstance(payload, list):
+            payload = b"".join(payload)
+
+        msg = json.loads(payload.decode("utf-8"))
+
+        target_nodes = msg.get("target_nodes", [])
+        if target_nodes and local_hostname not in target_nodes:
+            logger.debug(
+                "optimizer.global_relay.not_targeted",
+                target_nodes=target_nodes,
+                local_hostname=local_hostname,
+            )
+            return False
+
+        plan = ActionPlan(
+            plan_id=msg.get("plan_id", ""),
+            knob_id=msg.get("knob_id", ""),
+            target_function=msg.get("target_function", ""),
+            old_value=msg.get("old_value"),
+            new_value=msg.get("new_value"),
+            apply_when=msg.get("apply_when", "next_window"),
+            rationale=msg.get("rationale", "global optimizer"),
+            finding_type=msg.get("finding_type", "global"),
+            severity=msg.get("severity", 0.0),
+            opportunity_tag=msg.get("opportunity_tag", ""),
+            window_index=msg.get("window_index", -1),
+            target_nodes=target_nodes,
+        )
+
+        accepted = self.planner.apply_global_plan(plan)
+        if accepted is not None:
+            self._publish_plan(local_producer, accepted)
+            return True
+        return False
+
+    def run_mofka(
+        self,
+        group_file: str,
+        input_topic: str = "diagnosis.findings",
+        output_topic: str = "optimizer.plans",
+        registry_topic: str = "optimizer.registry",
+        consumer_name: str = "",
+        idle_timeout_sec: int = 0,
+        pull_timeout_ms: int = 1000,
+        no_registry: bool = False,
+        global_group_file: str = "",
+        global_input_topic: str = "global_plans",
+        relay_only: bool = False,
+    ):
+        from .streaming.mofka_io import open_consumer, open_producer
+
+        self._output_topic = output_topic
+        if output_topic == "global_plans":
+            self._plan_fanout = max(
+                1,
+                int(os.environ.get("DFOPTIMIZER_GLOBAL_PLAN_FANOUT", "1")),
+            )
+        else:
+            self._plan_fanout = 1
+
+        # Open ALL Mofka connections in the main thread to avoid GIL
+        # blocking from Mofka C extension network calls in background threads
+        consumer = None
+        if not relay_only:
+            _, consumer = open_consumer(
+                group_file, input_topic,
+                consumer_name=consumer_name or f"dfoptimizer_{os.getpid()}",
+            )
+        _, producer = open_producer(group_file, output_topic)
+
+        registry_consumer = None
+        ack_consumer = None
+        if not no_registry:
+            _, registry_consumer = open_consumer(
+                group_file, registry_topic,
+                consumer_name=f"dfoptimizer_registry_{os.getpid()}",
+            )
+            _, ack_consumer = open_consumer(
+                group_file, "optimizer_acks",
+                consumer_name=f"dfoptimizer_acks_{os.getpid()}",
+            )
+
+        # Open global plan consumer (ofi+cxi) in main thread if configured
+        global_consumer = None
+        if global_group_file:
+            try:
+                import mochi.mofka.client as mofka
+                logger.info("optimizer.global_driver.create", group_file=global_group_file)
+                global_driver = mofka.MofkaDriver(
+                    group_file=global_group_file, use_progress_thread=True,
+                )
+                global_topic = global_driver.open_topic(global_input_topic)
+                global_consumer = global_topic.consumer(
+                    name=f"dfoptimizer_global_{os.getpid()}",
+                    batch_size=mofka.AdaptiveBatchSize,
+                    data_allocator=mofka.ByteArrayAllocator,
+                    data_selector=mofka.FullDataSelector,
+                    thread_pool=global_driver.default_thread_pool,
+                )
+                logger.info("optimizer.global_consumer.ready", topic=global_input_topic)
+            except Exception:
+                logger.warning("optimizer.global_consumer.failed", exc_info=True)
+
+        install_shutdown_handler()
+
+        # Start registry listener in background thread (consumer already open)
+        registry_thread = None
+        if registry_consumer is not None:
+            registry_thread = threading.Thread(
+                target=self._registry_loop,
+                args=(group_file, registry_topic, registry_consumer),
+                daemon=True,
+                name="optimizer-registry",
+            )
+            registry_thread.start()
+
+        self._maybe_bootstrap_knobs()
+
+        # Start ack listener in background thread
+        ack_thread = None
+        if ack_consumer is not None:
+            ack_thread = threading.Thread(
+                target=self._ack_loop,
+                args=(ack_consumer,),
+                daemon=True,
+                name="optimizer-acks",
+            )
+            ack_thread.start()
+
+        # Start global plan relay if consumer available
+        global_thread = None
+        if global_consumer is not None and not relay_only:
+            global_thread = threading.Thread(
+                target=self._global_plans_loop,
+                args=(global_consumer, producer),
+                daemon=True,
+                name="optimizer-global-relay",
+            )
+            global_thread.start()
+
+        event_count = 0
+        plan_count = 0
+        error_count = 0
+        last_event_time = None
+        timeout_count = 0
+        wait_ms = pull_timeout_ms if pull_timeout_ms > 0 else 1000
+
+        logger.info(
+            "optimizer.stream.start",
+            input_topic=input_topic,
+            output_topic=output_topic,
+            registry_topic=registry_topic,
+            idle_timeout_sec=idle_timeout_sec,
+            relay_only=relay_only,
+        )
+
+        try:
+            if relay_only:
+                global_future = global_consumer.pull() if global_consumer is not None else None
+                while not _shutdown_requested:
+                    if global_future is None:
+                        time.sleep(wait_ms / 1000.0)
+                        continue
+
+                    event = self._wait_for_event(global_future, wait_ms)
+                    if event is None:
+                        continue
+
+                    try:
+                        self._process_global_plan_event(event, producer)
+                    except Exception:
+                        logger.exception("optimizer.global_relay.process_error")
+
+                    event.acknowledge()
+                    global_future = global_consumer.pull()
+            else:
+                future = consumer.pull()
+                while not _shutdown_requested:
+                    now = time.monotonic()
+                    if (
+                        last_event_time is not None
+                        and idle_timeout_sec > 0
+                        and (now - last_event_time) >= idle_timeout_sec
+                    ):
+                        logger.info(
+                            "optimizer.stream.idle_timeout",
+                            idle_sec=round(now - last_event_time, 1),
+                        )
+                        break
+
+                    try:
+                        event = future.wait(timeout_ms=wait_ms)
+                    except Exception as ex:
+                        if "timeout" in str(ex).lower():
+                            timeout_count += 1
+                            continue
+                        raise
+
+                    if event is None:
+                        timeout_count += 1
+                        continue
+
+                    last_event_time = time.monotonic()
+                    event_count += 1
+
+                    try:
+                        finding = self._parse_finding(event)
+                        if finding is not None:
+                            plans = self.planner.process_finding(finding)
+                            for plan in plans:
+                                self._publish_plan(producer, plan)
+                                plan_count += 1
+                    except Exception:
+                        error_count += 1
+                        logger.exception("optimizer.event.error", event_index=event_count)
+
+                    event.acknowledge()
+                    future = consumer.pull()
+
+            if _shutdown_requested:
+                logger.info("optimizer.stream.stop_signal", signal="SIGTERM")
+
+        finally:
+            producer.flush()
+            if registry_thread is not None:
+                registry_thread.join(timeout=wait_ms / 1000.0 + 1.0)
+            if ack_thread is not None:
+                ack_thread.join(timeout=wait_ms / 1000.0 + 1.0)
+            if global_thread is not None:
+                global_thread.join(timeout=wait_ms / 1000.0 + 1.0)
+            logger.info(
+                "optimizer.stream.done",
+                event_count=event_count,
+                plan_count=plan_count,
+                error_count=error_count,
+                knob_state=dict(self.planner.current_values),
+            )
+            if consumer is not None:
+                del consumer
+            del producer
+
+    def run_zmq(
+        self,
+        address: str,
+        bind: bool = True,
+        output_address: str = "",
+        output_bind: bool = True,
+        idle_timeout_sec: float = 10.0,
+        poll_timeout_ms: int = 1000,
+        plan_handler=None,
+    ):
+        """ZMQ streaming consumer mirroring run_mofka's core loop: pull diagnosis
+        findings (multipart [metadata, wire_dict], matching diagnose_zmq), run the
+        planner, emit/collect ActionPlans. Skips the Mofka registry/ack/global-plan
+        machinery; knobs come from _maybe_bootstrap_knobs (DFOPTIMIZER_BOOTSTRAP_DLIO=1).
+        Returns the list of plans produced."""
+        import zmq
+        from .streaming.zmq_io import open_consumer, open_producer
+
+        class _Ev:
+            __slots__ = ("metadata", "data")
+
+            def __init__(self, metadata, data):
+                self.metadata = metadata
+                self.data = data
+
+        context, consumer = open_consumer(address, bind=bind)
+        poller = zmq.Poller()
+        poller.register(consumer, zmq.POLLIN)
+
+        out_ctx = producer = None
+        if output_address:
+            out_ctx, producer = open_producer(output_address, bind=output_bind)
+        self._output_topic = output_address
+        self._plan_fanout = 1
+
+        self._maybe_bootstrap_knobs()
+        install_shutdown_handler()
+
+        event_count = plan_count = 0
+        last_event_time = None
+        plans_all = []
+        logger.info("optimizer.zmq.start", address=address, idle_timeout_sec=idle_timeout_sec)
+        try:
+            while not _shutdown_requested:
+                socks = dict(poller.poll(timeout=poll_timeout_ms))
+                if consumer not in socks:
+                    if (last_event_time is not None and idle_timeout_sec > 0
+                            and (time.monotonic() - last_event_time) >= idle_timeout_sec):
+                        logger.info("optimizer.zmq.idle_timeout",
+                                    idle_sec=round(time.monotonic() - last_event_time, 1))
+                        break
+                    continue
+                parts = consumer.recv_multipart()
+                last_event_time = time.monotonic()
+                event_count += 1
+                try:
+                    meta = json.loads(parts[0].decode("utf-8")) if parts else {}
+                except (ValueError, TypeError):
+                    meta = {}
+                if meta.get("name") == "end" or meta.get("type") == "stop":
+                    logger.info("optimizer.zmq.stop_sentinel")
+                    break
+                data = parts[1] if len(parts) > 1 else None
+                try:
+                    finding = self._parse_finding(_Ev(meta, data))
+                    if finding is not None:
+                        for plan in self.planner.process_finding(finding):
+                            plans_all.append(plan)
+                            plan_count += 1
+                            if producer is not None:
+                                self._publish_plan_zmq(producer, plan)
+                            if plan_handler is not None:
+                                plan_handler(plan)
+                            logger.info("optimizer.plan", plan_id=plan.plan_id,
+                                        knob_id=plan.knob_id, old_value=plan.old_value,
+                                        new_value=plan.new_value,
+                                        target_function=plan.target_function,
+                                        rationale=plan.rationale)
+                except Exception:
+                    logger.exception("optimizer.zmq.event_error", event_index=event_count)
+        finally:
+            logger.info("optimizer.zmq.done", event_count=event_count,
+                        plan_count=plan_count, knob_state=dict(self.planner.current_values))
+            if producer is not None:
+                producer.close(linger=0)
+                out_ctx.term()
+            consumer.close(linger=0)
+            context.term()
+        return plans_all
+
+    def _publish_plan_zmq(self, producer, plan: ActionPlan):
+        metadata = {
+            "type": "action_plan",
+            "plan_id": plan.plan_id,
+            "knob_id": plan.knob_id,
+            "target_function": plan.target_function,
+        }
+        producer.send_multipart([
+            json.dumps(metadata).encode("utf-8"),
+            json.dumps(dataclasses.asdict(plan)).encode("utf-8"),
+        ])
+        self._plans_produced += 1
+
+    def run_file(self, findings_path: str, plan_handler=None):
+        """Offline: replay saved diagnosis findings (a JSONL file of finding wire-dicts,
+        one per line, or a JSON array) through the planner and return the ActionPlans it
+        would emit. No transport, no actuation -- the optimizer analog of dfdiagnoser's
+        diagnose_facts, for reproducing/inspecting planner decisions on recorded findings."""
+        class _Ev:
+            __slots__ = ("metadata", "data")
+
+            def __init__(self, data):
+                self.metadata = {}
+                self.data = data
+
+        self._maybe_bootstrap_knobs()
+        with open(findings_path, "r", encoding="utf-8") as fh:
+            text = fh.read().strip()
+        records = json.loads(text) if text.startswith("[") else [
+            json.loads(line) for line in text.splitlines() if line.strip()
+        ]
+        plans_all = []
+        for rec in records:
+            finding = self._parse_finding(_Ev(json.dumps(rec).encode("utf-8")))
+            if finding is None:
+                continue
+            for plan in self.planner.process_finding(finding):
+                plans_all.append(plan)
+                if plan_handler is not None:
+                    plan_handler(plan)
+                logger.info("optimizer.plan", plan_id=plan.plan_id, knob_id=plan.knob_id,
+                            old_value=plan.old_value, new_value=plan.new_value,
+                            target_function=plan.target_function, rationale=plan.rationale)
+        logger.info("optimizer.file.done", findings=len(records),
+                    plan_count=len(plans_all), knob_state=dict(self.planner.current_values))
+        return plans_all
+
+    def _registry_loop(self, group_file: str, registry_topic: str, consumer=None):
+        """Background thread: listen for knob registrations from apps."""
+        if consumer is None:
+            try:
+                from .streaming.mofka_io import open_consumer
+                _, consumer = open_consumer(
+                    group_file, registry_topic,
+                    consumer_name=f"dfoptimizer_registry_{os.getpid()}",
+                )
+            except Exception:
+                logger.warning("optimizer.registry.connect_failed", topic=registry_topic, exc_info=True)
+                return
+
+        logger.info("optimizer.registry.listening", topic=registry_topic)
+        future = consumer.pull()
+
+        while not _shutdown_requested:
+            try:
+                event = future.wait(timeout_ms=1000)
+            except Exception as ex:
+                if "timeout" in str(ex).lower():
+                    continue
+                logger.error("optimizer.registry.listen_error", error=str(ex))
+                break
+
+            if event is None:
+                continue
+
+            try:
+                self._handle_registration(event)
+            except Exception:
+                logger.exception("optimizer.registry.error")
+
+            event.acknowledge()
+            future = consumer.pull()
+
+        if _shutdown_requested:
+            logger.info("optimizer.registry.stop_signal", signal="SIGTERM")
+
+        del consumer
+
+    def _ack_loop(self, consumer):
+        """Background thread: listen for plan acks from apps."""
+        logger.info("optimizer.acks.listening")
+        future = consumer.pull()
+
+        while not _shutdown_requested:
+            try:
+                event = future.wait(timeout_ms=1000)
+            except Exception as ex:
+                if "timeout" in str(ex).lower():
+                    continue
+                logger.error("optimizer.acks.listen_error", error=str(ex))
+                break
+
+            if event is None:
+                continue
+
+            try:
+                payload = event.data
+                if isinstance(payload, list):
+                    payload = b"".join(payload)
+                msg = json.loads(payload.decode("utf-8"))
+                self.planner.apply_ack(
+                    plan_id=msg.get("plan_id", ""),
+                    knob_id=msg.get("knob_id", ""),
+                    status=msg.get("status", "unknown"),
+                    old_value=msg.get("old_value"),
+                    new_value=msg.get("new_value"),
+                    window_index=msg.get("window_index", -1),
+                    target_nodes=msg.get("target_nodes"),
+                )
+            except Exception:
+                logger.exception("optimizer.acks.error")
+
+            event.acknowledge()
+            future = consumer.pull()
+
+        if _shutdown_requested:
+            logger.info("optimizer.acks.stop_signal", signal="SIGTERM")
+        del consumer
+
+    def _global_plans_loop(self, consumer, local_producer):
+        """Background thread: receive global plans, validate via planner, publish locally."""
+        import socket
+        local_hostname = socket.gethostname()
+        logger.info("optimizer.global_relay.listening", local_hostname=local_hostname)
+        future = consumer.pull()
+        accepted_count = 0
+        skipped_count = 0
+
+        while not _shutdown_requested:
+            try:
+                event = self._wait_for_event(future, 1000)
+            except Exception as ex:
+                logger.error("optimizer.global_relay.error", error=str(ex))
+                break
+
+            if event is None:
+                continue
+
+            try:
+                if self._process_global_plan_event(event, local_producer):
+                    accepted_count += 1
+                else:
+                    skipped_count += 1
+            except Exception:
+                logger.exception("optimizer.global_relay.process_error")
+
+            event.acknowledge()
+            future = consumer.pull()
+
+        logger.info(
+            "optimizer.global_relay.done",
+            accepted=accepted_count,
+            skipped=skipped_count,
+        )
+
+    def _handle_registration(self, event):
+        payload = event.data
+        if payload is None:
+            return
+        if isinstance(payload, list):
+            payload = b"".join(payload)
+
+        msg = json.loads(payload.decode("utf-8"))
+        namespace = msg.get("namespace", "app")
+        func_name = msg.get("function_name", "")
+        knobs_wire = msg.get("knobs", {})
+        wire_current_values = msg.get("current_values", {})
+
+        # DFTracer sends knobs as a JSON array of objects (each with "id"),
+        # while DLIO sends a dict keyed by param name.  Normalize to dict.
+        if isinstance(knobs_wire, list):
+            knobs_wire = {k.get("id", f"knob_{i}"): k for i, k in enumerate(knobs_wire)}
+
+        knob_defs = {}
+        current_values = {}
+        for param_name, kw in knobs_wire.items():
+            # DFTracer uses "knob_response" (single response applied to all
+            # severity tags), while DLIO uses "responds_to" (tag -> response
+            # dict).  Normalize to responds_to format.
+            if "knob_response" in kw and "responds_to" not in kw:
+                resp = kw.pop("knob_response")
+                kw["responds_to"] = {"io_bottleneck": resp}
+            kdef = knob_def_from_wire(kw)
+            knob_defs[kdef.id] = kdef
+            if param_name in wire_current_values:
+                current_values[kdef.id] = wire_current_values[param_name]
+            elif kdef.id in wire_current_values:
+                current_values[kdef.id] = wire_current_values[kdef.id]
+
+        logger.info(
+            "optimizer.registry.received",
+            namespace=namespace,
+            function=func_name,
+            knobs=list(knob_defs.keys()),
+            current_values=current_values,
+        )
+
+        self.planner.register_knobs(knob_defs, current_values=current_values)
+
+    def _parse_finding(self, event) -> DiagnosisFindingMsg | None:
+        raw_metadata = event.metadata if hasattr(event, "metadata") else None
+        if isinstance(raw_metadata, dict):
+            metadata = raw_metadata
+        elif isinstance(raw_metadata, str):
+            try:
+                metadata = json.loads(raw_metadata)
+            except (ValueError, TypeError):
+                metadata = {}
+        else:
+            metadata = {}
+
+        # Check for stop sentinel
+        if metadata.get("name") == "end" or metadata.get("type") == "stop":
+            logger.info("optimizer.stream.stop_sentinel")
+            return None
+
+        payload = event.data
+        if payload is None:
+            return None
+        if isinstance(payload, list):
+            payload = b"".join(payload)
+
+        msg = json.loads(payload.decode("utf-8"))
+
+        return DiagnosisFindingMsg(
+            finding_type=msg.get("finding_type", ""),
+            scope=msg.get("scope", ""),
+            layer=msg.get("layer"),
+            motif=msg.get("motif", "unclassified"),
+            severity=msg.get("severity", "unknown"),
+            severity_score=float(msg.get("severity_score", 0.0)),
+            confidence=msg.get("confidence", 0),
+            prevalence=msg.get("prevalence", 0),
+            persistence=msg.get("persistence", 0),
+            support_windows=msg.get("support_windows", 0),
+            trend_direction=msg.get("trend_direction", "insufficient_data"),
+            last_seen_window=msg.get("last_seen_window", msg.get("window_index", 0)),
+            contributing_facts=[
+                tuple(f) for f in msg.get("contributing_facts", [])
+            ],
+            recommendation_bundle=msg.get("recommendation_bundle", ""),
+            opportunity_tags=msg.get("opportunity_tags", []),
+            summary=msg.get("summary", ""),
+            window_index=msg.get("window_index", 0),
+            publish_mode=msg.get("publish_mode", "control"),
+            suppresses_tags=msg.get("suppresses_tags", []),
+            key_metrics=msg.get("key_metrics", {}),
+        )
+
+    def _publish_plan(self, producer, plan: ActionPlan):
+        payload = json.dumps(dataclasses.asdict(plan)).encode("utf-8")
+        metadata = {
+            "type": "action_plan",
+            "plan_id": plan.plan_id,
+            "knob_id": plan.knob_id,
+            "target_function": plan.target_function,
+        }
+        if plan.target_nodes:
+            metadata["target_nodes"] = plan.target_nodes
+        for _ in range(self._plan_fanout):
+            producer.push(metadata=metadata, data=payload)
+        logger.info(
+            "optimizer.plan.published",
+            plan_id=plan.plan_id,
+            knob_id=plan.knob_id,
+            old_value=plan.old_value,
+            new_value=plan.new_value,
+            target_function=plan.target_function,
+            target_nodes=plan.target_nodes or "all",
+            fanout=self._plan_fanout,
+            rationale=plan.rationale,
+        )
+        self._plans_produced += 1
